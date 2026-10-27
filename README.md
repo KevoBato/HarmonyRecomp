@@ -6,6 +6,16 @@ The PowerPC code of `default.xex` and the character modules is translated to C++
 
 > **This repository contains no game code or data.** You need your own copy of the game, dumped from your own console or purchase. Never share `game/`, `assets/`, `dlc/` or `generated/`: they contain the game or code derived from it.
 
+## Screenshots
+
+| Title screen | Online lobby |
+| --- | --- |
+| ![Title screen](1-titel.jpg) | ![Online lobby](2-lobby.jpg) |
+
+| In-game with graphics menu | Gameplay with FPS counter |
+| --- | --- |
+| ![In-game with graphics menu](3-settings.jpg) | ![Gameplay with FPS counter](4-gameplay.jpg) |
+
 ## Features
 
 - Runs the full game natively on Windows: all stages, all six base characters
