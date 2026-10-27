@@ -1,0 +1,9 @@
+# harmonyrecomp - codegen config for dllaxearmor.dll (Axe Armor)
+#
+# Small functions referenced only by pointers in this DLL's .rdata/.data
+# (vtables, callback tables). Found by scanning the code the first codegen
+# pass did not cover; kept if the target follows a return or padding and
+# ends in blr/bctr/b within 64 instructions.
+
+[functions]
+0x83537BC4 = {}   # 9 instructions

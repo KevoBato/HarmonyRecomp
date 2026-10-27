@@ -1,0 +1,908 @@
+#!/usr/bin/env python3
+"""Build HarmonyRecomp from scratch.
+
+Runs every step in order and skips the ones that are already done:
+
+  1. Extract the XBLA package in game/ into assets/   (needs assets/default.xex)
+     and any DLC packages in dlc/ into assets/dlc/
+  2. Clone the ReXGlue SDK at the pinned commit      (../rexglue-sdk, next to the project)
+  3. Build and install the SDK, including the rexglue codegen tool
+  4. Run codegen: PowerPC -> C++ for default.xex, the six player DLLs and the
+     player DLLs of your DLC
+  5. Build the game executable
+
+Usage:
+  python scripts/build.py                 # release build
+  python scripts/build.py --debug         # debug build
+  python scripts/build.py --codegen-only  # stop after step 4
+  python scripts/build.py --force-codegen # rerun codegen even if output exists
+
+Requirements (Windows): scoop install llvm cmake ninja git python
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# The SDK must live OUTSIDE the project folder: before codegen, rexglue scans
+# the whole project (everything except generated/) for legacy identifiers and
+# asks to rewrite them. With the SDK inside, it finds hits in the SDK's own
+# sources and tests and waits for a [y/N] answer, which must not be "yes".
+SDK_DIR = ROOT.parent / "rexglue-sdk"
+SDK_PIN_FILE = ROOT / "sdk-pin.txt"
+MANIFEST = ROOT / "harmonyrecomp_manifest.toml"
+# Your own DLC packages (the files from 58410A7A/00000002/) and what they unpack
+# to. Like game/ and assets/ these hold game content and are never committed.
+# Codegen only reads modules inside the game root, hence assets/dlc/.
+DLC_DIR = ROOT / "dlc"
+DLC_ASSETS = ROOT / "assets" / "dlc"
+# Manifest used for codegen when DLC modules are present: the base manifest
+# plus one [[modules]] entry per DLC player DLL. Generated, not committed.
+LOCAL_MANIFEST = ROOT / "harmonyrecomp_manifest.local.toml"
+TITLE_ID = 0x58410A7A
+
+
+def run(args, cwd=None):
+    print("+ " + " ".join(str(a) for a in args), flush=True)
+    result = subprocess.run([str(a) for a in args], cwd=cwd)
+    if result.returncode != 0:
+        sys.exit(f"error: command failed with exit code {result.returncode}")
+
+
+def git(*args) -> list:
+    """git command that works on drives without file ownership (exFAT/FAT32).
+
+    safe.directory given with -c counts as protected configuration and is
+    passed on to the git processes spawned for submodules.
+    """
+    return ["git", "-c", "safe.directory=*", *args]
+
+
+def platform_id() -> str:
+    os_name = platform.system()
+    arch = platform.machine().lower()
+    os_id = {"Windows": "win", "Linux": "linux"}.get(os_name)
+    if os_id is None:
+        sys.exit(f"error: unsupported OS {os_name}")
+    if arch in ("x86_64", "amd64"):
+        return f"{os_id}-amd64"
+    if arch in ("aarch64", "arm64"):
+        return f"{os_id}-arm64"
+    sys.exit(f"error: unsupported architecture {arch}")
+
+
+def check_tools() -> None:
+    missing = [t for t in ("cmake", "ninja", "git", "clang++") if shutil.which(t) is None]
+    if missing:
+        sys.exit(
+            "error: missing tool(s): " + ", ".join(missing) +
+            "\n  Windows: scoop install llvm cmake ninja git"
+        )
+
+
+def read_pin() -> tuple[str, str]:
+    url, commit = "", ""
+    for line in SDK_PIN_FILE.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("url="):
+            url = line[4:]
+        elif line.startswith("commit="):
+            commit = line[7:]
+    if not url or not commit:
+        sys.exit(f"error: {SDK_PIN_FILE.name} needs url= and commit= lines")
+    return url, commit
+
+
+def step_extract() -> None:
+    if (ROOT / "assets" / "default.xex").exists():
+        print("[1/5] assets/default.xex present, skipping extraction")
+        return
+    print("[1/5] Extracting game package")
+    packages = [p for p in (ROOT / "game").glob("*") if p.is_file()]
+    if len(packages) != 1:
+        sys.exit("error: put exactly one XBLA package file (the 'LIVE' file) into game/")
+    run([sys.executable, ROOT / "scripts" / "extract_game.py", packages[0],
+         "--assets", ROOT / "assets"])
+
+
+def active_manifest() -> Path:
+    return LOCAL_MANIFEST if LOCAL_MANIFEST.exists() else MANIFEST
+
+
+def base_guest_paths() -> set[str]:
+    paths = set()
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("guest_path"):
+            paths.add(line.split('"')[1].lower())
+    return paths
+
+
+def step_dlc() -> None:
+    """Unpack DLC packages from dlc/ and add their player DLLs to codegen.
+
+    The game loads DLC characters with XexLoadImage from the mounted package
+    ("<device>:\\data\\player_dll\\dllXyz.dll"); the runtime matches the path
+    without the device prefix, so a DLC module only needs a manifest entry with
+    the path inside its package. The packages themselves are installed into the
+    runtime's content folder when the game starts (see src/dlc.cpp).
+    """
+    packages = sorted(p for p in DLC_DIR.glob("*")
+                      if p.is_file() and not p.name.startswith(".") and p.suffix.lower() != ".txt")
+    if not packages:
+        if LOCAL_MANIFEST.exists():
+            LOCAL_MANIFEST.unlink()
+        print("      no DLC packages in dlc/")
+        return
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import extract_game  # noqa: E402  (scripts/ is not a package)
+
+    known = base_guest_paths()
+    modules: list[tuple[str, str, str]] = []  # (guest path, file path, name)
+    for package_path in packages:
+        try:
+            package = extract_game.Package(package_path)
+        except RuntimeError as err:
+            print(f"      skipping {package_path.name}: {err}")
+            continue
+        if package.title_id != TITLE_ID:
+            print(f"      skipping {package_path.name}: belongs to title {package.title_id:08X}")
+            continue
+        if package.content_type != extract_game.CONTENT_TYPE_MARKETPLACE:
+            print(f"      skipping {package_path.name}: not a DLC package "
+                  f"(content type {package.content_type:08X})")
+            continue
+        out_dir = DLC_ASSETS / package_path.name
+        marker = out_dir / ".extracted"
+        stamp = f"{package_path.stat().st_size}:{int(package_path.stat().st_mtime)}"
+        if not marker.exists() or marker.read_text().strip() != stamp:
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            extract_game.extract(package_path, out_dir, require_xex=False)
+            marker.write_text(stamp + "\n")
+        print(f"      DLC: {package.display_name or package_path.name}")
+        for dll in sorted(out_dir.rglob("*")):
+            if not dll.is_file() or dll.suffix.lower() != ".dll":
+                continue
+            guest = dll.relative_to(out_dir).as_posix().lower()
+            if guest in known:
+                continue
+            known.add(guest)
+            modules.append((guest, dll.relative_to(ROOT).as_posix(), dll.stem))
+            print(f"        module {guest}")
+
+    if not modules:
+        if LOCAL_MANIFEST.exists():
+            LOCAL_MANIFEST.unlink()
+        return
+    text = MANIFEST.read_text(encoding="utf-8").rstrip() + "\n"
+    text = ("# Generated by scripts/build.py from harmonyrecomp_manifest.toml and the\n"
+            "# DLC packages in dlc/. Do not edit or commit.\n\n") + text
+    for guest, file_path, name in modules:
+        key = name.lower()
+        text += (f"\n[[modules]]\n"
+                 f'guest_path = "{guest}"\n'
+                 f'file_path = "{file_path}"\n'
+                 f'out_directory_path = "generated/{key}"\n')
+        # A committed config with functions only reachable through pointers,
+        # like the ones for the base characters, is used when present.
+        if (ROOT / f"harmonyrecomp_{key}.toml").exists():
+            text += f'includes = ["harmonyrecomp_{key}.toml"]\n'
+    if not LOCAL_MANIFEST.exists() or LOCAL_MANIFEST.read_text(encoding="utf-8") != text:
+        LOCAL_MANIFEST.write_text(text, encoding="utf-8")
+
+
+def resolve_symlink_placeholders(repo: Path) -> int:
+    """Replace git symlink placeholders with copies of their targets.
+
+    On file systems without symlink support (exFAT/FAT32, or NTFS without
+    Developer Mode) git checks out a symlink as a small text file holding the
+    link target, e.g. "../../libmspack/mspack/lzxd.c". The compiler then
+    tries to parse that path as source code. libmspack and o1heap in the SDK
+    contain such links, so turn every placeholder into a real copy.
+    """
+    proc = subprocess.run(
+        git("ls-files", "-s", "-z", "--recurse-submodules"),
+        cwd=repo, capture_output=True,
+    )
+    if proc.returncode != 0:
+        print("warning: could not list SDK files for the symlink check:")
+        print("  " + proc.stderr.decode("utf-8", "replace").strip())
+        return 0
+    out = proc.stdout.decode("utf-8", "replace")
+    links = []
+    for record in out.split("\0"):
+        if record.startswith("120000 "):
+            links.append(repo / record.split("\t", 1)[1])
+
+    pending = {link.resolve() for link in links
+               if not link.is_symlink() and link.is_file() and link.stat().st_size <= 1024}
+    fixed = 0
+    # Repeat so links that point at other links resolve too.
+    for _ in range(5):
+        changed = False
+        for link in links:
+            if link.resolve() not in pending:
+                continue
+            target_rel = link.read_text(encoding="utf-8", errors="replace").strip()
+            target = (link.parent / target_rel).resolve()
+            if target in pending or not target.exists():
+                continue  # target not real yet (or missing); try next round
+            link.unlink()
+            if target.is_dir():
+                shutil.copytree(target, link)
+            else:
+                shutil.copy2(target, link)
+            pending.discard(link.resolve())
+            fixed += 1
+            changed = True
+        if not changed:
+            break
+    if pending:
+        print(f"warning: {len(pending)} symlink placeholder(s) could not be resolved:")
+        for path in sorted(pending):
+            print(f"  {path}")
+    return fixed
+
+
+# Local changes to the pinned SDK, applied idempotently after cloning.
+# Each entry is (file, original text, replacement text). They are applied as
+# plain text replacements (not a .patch file) so CRLF checkouts on Windows
+# work too. When the set changes, step 3 rebuilds the SDK incrementally.
+SDK_PATCHES = [
+    # 1) The block scanner honours [[switch_tables]] from the project config.
+    #    Without this, a jump table with no bounds check (sub_8277ECF0 in this
+    #    game) is read for up to max_jump_table_entries entries and the
+    #    function swallows its neighbour, which then fails to compile with
+    #    "use of undeclared label".
+    (
+        "include/rex/codegen/function_scanner.h",
+        """                                    const std::unordered_set<uint32_t>& knownFunctions,
+                                    uint32_t pdataSize = 0);""",
+        """                                    const std::unordered_set<uint32_t>& knownFunctions,
+                                    uint32_t pdataSize = 0,
+                                    const std::unordered_map<uint32_t, JumpTable>*
+                                        manualSwitchTables = nullptr);""",
+    ),
+    (
+        "include/rex/codegen/function_scanner.h",
+        "#include <unordered_set>\n",
+        "#include <unordered_map>\n#include <unordered_set>\n",
+    ),
+    (
+        "src/codegen/function_scanner.cpp",
+        """                                    const std::unordered_set<uint32_t>& knownFunctions,
+                                    uint32_t pdataSize) {""",
+        """                                    const std::unordered_set<uint32_t>& knownFunctions,
+                                    uint32_t pdataSize,
+                                    const std::unordered_map<uint32_t, JumpTable>*
+                                        manualSwitchTables) {""",
+    ),
+    (
+        "src/codegen/function_scanner.cpp",
+        """          auto jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);""",
+        """          // A [[switch_tables]] entry from the project config overrides the
+          // heuristic. Tables without a bounds check otherwise read up to
+          // max_jump_table_entries bytes and can swallow the next function.
+          std::optional<JumpTable> jt;
+          if (manualSwitchTables) {
+            auto manual = manualSwitchTables->find(addr);
+            if (manual != manualSwitchTables->end()) {
+              jt = manual->second;
+              REXCODEGEN_TRACE("discoverBlocks: bctr at 0x{:08X} uses config switch table ({} targets)",
+                               addr, jt->targets.size());
+            }
+          }
+          if (!jt) {
+            jt = detectJumpTable(decoded, addr, containingRegion, entryPoint, funcEnd);
+          }""",
+    ),
+    (
+        "src/codegen/phase_discover.cpp",
+        "  auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize);",
+        "  auto result = discoverBlocks(decoded, funcAddr, *region, knownFunctions, pdataSize,\n"
+        "                               &ctx.Config().switchTables);",
+    ),
+]
+# SDK change 2: relocatable indirect-call table.
+#
+# The dispatch table of a module always sat right after its image
+# (image_base + image_size). For Harmony of Despair the main table is ~13 MB
+# and ends at 0x836BE990, but the player DLLs load at fixed addresses from
+# 0x83000000, so loading dllAlucard.dll failed ("Module image range ...
+# overlaps existing ..."). This adds an optional table_base: 0 keeps the old
+# placement, a project can move one module's table by defining
+# REX_FUNC_TABLE_BASE for that module's generated code.
+SDK_PATCHES += [
+    (
+        "include/rex/image_info.h",
+        "  RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects\n",
+        "  RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects\n"
+        "  u32 table_base = 0;  ///< Guest address of the indirect-call table; 0 = image_base + image_size\n",
+    ),
+    (
+        "resources/templates/codegen/init_h.inja",
+        "#define REX_THUNK_RESERVE_SIZE {{ thunk_reserve_size }}ull\n",
+        "#define REX_THUNK_RESERVE_SIZE {{ thunk_reserve_size }}ull\n"
+        "// Guest address of this module's indirect-call table. Defaults to right\n"
+        "// after the image; define it for the module's target to move the table.\n"
+        "#ifndef REX_FUNC_TABLE_BASE\n"
+        "#define REX_FUNC_TABLE_BASE (REX_IMAGE_BASE + REX_IMAGE_SIZE)\n"
+        "#endif\n",
+    ),
+    (
+        "resources/templates/codegen/init_cpp.inja",
+        "    .register_modules = RegisterRecompiledModules,\n{% endif %}\n};\n",
+        "    .register_modules = RegisterRecompiledModules,\n{% endif %}\n"
+        "    .table_base = static_cast<u32>(REX_FUNC_TABLE_BASE),\n};\n",
+    ),
+    (
+        "resources/templates/codegen/_indirect_call.inja",
+        "  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))",
+        "  (*(PPCFunc**)(x + REX_FUNC_TABLE_BASE + (u64(u32(y) - REX_CODE_BASE) * 2)))",
+    ),
+    (
+        "include/rex/system/xmemory.h",
+        "  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                               uint32_t image_size);\n",
+        "  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                               uint32_t image_size, uint32_t table_base = 0);\n",
+    ),
+    (
+        "src/system/xmemory.cpp",
+        "bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                                     uint32_t image_size) {\n"
+        "  constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;\n"
+        "  uint32_t table_base = image_base + image_size;\n",
+        "bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                                     uint32_t image_size, uint32_t table_base_override) {\n"
+        "  constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;\n"
+        "  uint32_t table_base = table_base_override ? table_base_override : image_base + image_size;\n",
+    ),
+    (
+        "include/rex/system/function_dispatcher.h",
+        "  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                               uint32_t image_size, bool is_entrypoint = false);\n",
+        "  bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,\n"
+        "                               uint32_t image_size, bool is_entrypoint = false,\n"
+        "                               uint32_t table_base = 0);\n",
+    ),
+    (
+        "include/rex/system/function_dispatcher.h",
+        "    uint32_t image_size;\n    uint32_t next_thunk_address;\n",
+        "    uint32_t image_size;\n    uint32_t table_base;\n    uint32_t next_thunk_address;\n",
+    ),
+    (
+        "src/system/function_dispatcher.cpp",
+        "                                                 uint32_t image_base, uint32_t image_size,\n"
+        "                                                 bool is_entrypoint) {\n",
+        "                                                 uint32_t image_base, uint32_t image_size,\n"
+        "                                                 bool is_entrypoint, uint32_t table_base) {\n",
+    ),
+    (
+        "src/system/function_dispatcher.cpp",
+        "  uint32_t new_table_end = image_base + image_size + (code_size + kThunkReserveSize) * 2;\n"
+        "  uint32_t new_code_end = code_base + code_size + kThunkReserveSize;\n"
+        "  for (const auto& existing : module_tables_) {\n"
+        "    uint32_t existing_table_end =\n"
+        "        existing.image_base + existing.image_size + (existing.code_size + kThunkReserveSize) * 2;\n"
+        "    uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;\n"
+        "    if (image_base < existing_table_end && new_table_end > existing.image_base) {\n"
+        "      REXLOG_ERROR(\"Module image range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})\",\n"
+        "                   image_base, new_table_end, existing.image_base, existing_table_end);\n"
+        "      return false;\n"
+        "    }\n",
+        "  if (table_base == 0) {\n"
+        "    table_base = image_base + image_size;\n"
+        "  }\n"
+        "  uint32_t new_table_end = table_base + (code_size + kThunkReserveSize) * 2;\n"
+        "  uint32_t new_image_end = image_base + image_size;\n"
+        "  uint32_t new_code_end = code_base + code_size + kThunkReserveSize;\n"
+        "  auto overlaps = [](uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {\n"
+        "    return a0 < b1 && b0 < a1;\n"
+        "  };\n"
+        "  for (const auto& existing : module_tables_) {\n"
+        "    uint32_t existing_image_end = existing.image_base + existing.image_size;\n"
+        "    uint32_t existing_table_end =\n"
+        "        existing.table_base + (existing.code_size + kThunkReserveSize) * 2;\n"
+        "    uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;\n"
+        "    // Image and table of the new module must not overlap the image or the\n"
+        "    // table of any module already registered.\n"
+        "    if (overlaps(image_base, new_image_end, existing.image_base, existing_image_end) ||\n"
+        "        overlaps(image_base, new_image_end, existing.table_base, existing_table_end) ||\n"
+        "        overlaps(table_base, new_table_end, existing.image_base, existing_image_end) ||\n"
+        "        overlaps(table_base, new_table_end, existing.table_base, existing_table_end)) {\n"
+        "      REXLOG_ERROR(\n"
+        "          \"Module image [{:08X}, {:08X}) / table [{:08X}, {:08X}) overlaps existing image \"\n"
+        "          \"[{:08X}, {:08X}) / table [{:08X}, {:08X})\",\n"
+        "          image_base, new_image_end, table_base, new_table_end, existing.image_base,\n"
+        "          existing_image_end, existing.table_base, existing_table_end);\n"
+        "      return false;\n"
+        "    }\n",
+    ),
+    (
+        "src/system/function_dispatcher.cpp",
+        "  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size)) {\n",
+        "  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size,\n"
+        "                                        table_base)) {\n",
+    ),
+    (
+        "src/system/function_dispatcher.cpp",
+        "      .image_size = image_size,\n      .next_thunk_address = code_base + code_size,\n",
+        "      .image_size = image_size,\n      .table_base = table_base,\n"
+        "      .next_thunk_address = code_base + code_size,\n",
+    ),
+    (
+        "src/system/function_dispatcher.cpp",
+        "  REXLOG_INFO(\"Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}\",\n"
+        "              code_base, code_base + code_size, image_base, image_base + image_size);\n",
+        "  REXLOG_INFO(\n"
+        "      \"Function table initialized for module: code={:08X}-{:08X}, image={:08X}-{:08X}, \"\n"
+        "      \"table={:08X}-{:08X}\",\n"
+        "      code_base, code_base + code_size, image_base, image_base + image_size, table_base,\n"
+        "      new_table_end);\n",
+    ),
+    (
+        "src/system/runtime.cpp",
+        "                                                     image_info.image_base, image_info.image_size,\n"
+        "                                                     /*is_entrypoint=*/true)) {\n",
+        "                                                     image_info.image_base, image_info.image_size,\n"
+        "                                                     /*is_entrypoint=*/true,\n"
+        "                                                     image_info.table_base)) {\n",
+    ),
+]
+
+# SDK change 3: XamShowMessageBoxUI read title and text without byte-swapping.
+# Guest UTF-16 is big-endian, so "S" (0x0053) arrived as 0x5300, a CJK glyph
+# missing from the overlay font, and the save prompts showed only "?". The
+# buttons already used load_and_swap and were fine. Also log the text so we
+# can see what the game asks.
+SDK_PATCHES += [
+    (
+        "src/kernel/xam/xam_ui.cpp",
+        "    title = rex::string::to_utf8(title_ptr.value());\n",
+        "    // Guest strings are big-endian UTF-16; value() returns them unswapped.\n"
+        "    title = rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(\n"
+        "        REX_KERNEL_MEMORY()->TranslateVirtual(title_ptr.guest_address())));\n",
+    ),
+    (
+        "src/kernel/xam/xam_ui.cpp",
+        "  std::vector<std::string> buttons;\n",
+        "  std::string text;\n"
+        "  if (text_ptr) {\n"
+        "    text = rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(\n"
+        "        REX_KERNEL_MEMORY()->TranslateVirtual(text_ptr.guest_address())));\n"
+        "  }\n"
+        "  REXKRNL_INFO(\"XamShowMessageBoxUI: title=\\\"{}\\\" text=\\\"{}\\\"\", title, text);\n"
+        "\n"
+        "  std::vector<std::string> buttons;\n",
+    ),
+    (
+        "src/kernel/xam/xam_ui.cpp",
+        "new MessageBoxDialog(imgui_drawer, title, rex::string::to_utf8(text_ptr.value()), buttons,",
+        "new MessageBoxDialog(imgui_drawer, title, text, buttons,",
+    ),
+]
+
+# SDK change 4: SaveConfig wrote string values without TOML escaping. A
+# Windows path such as game_data_root = "H:\Castlevania HD\..." is invalid
+# TOML, so on the next start the whole settings file failed to parse and every
+# setting in it (resolution, anti-aliasing, license_mask) was silently ignored.
+SDK_PATCHES += [
+    (
+        "src/core/cvar.cpp",
+        "std::string SerializeToTOML() {\n",
+        "// Quote a value as a TOML basic string (escapes \\, \" and control chars).\n"
+        "static std::string TomlQuote(const std::string& value) {\n"
+        "  std::string out = \"\\\"\";\n"
+        "  for (unsigned char c : value) {\n"
+        "    switch (c) {\n"
+        "      case '\\\\': out += \"\\\\\\\\\"; break;\n"
+        "      case '\"': out += \"\\\\\\\"\"; break;\n"
+        "      case '\\b': out += \"\\\\b\"; break;\n"
+        "      case '\\t': out += \"\\\\t\"; break;\n"
+        "      case '\\n': out += \"\\\\n\"; break;\n"
+        "      case '\\f': out += \"\\\\f\"; break;\n"
+        "      case '\\r': out += \"\\\\r\"; break;\n"
+        "      default:\n"
+        "        if (c < 0x20 || c == 0x7F) {\n"
+        "          static const char kHex[] = \"0123456789ABCDEF\";\n"
+        "          out += \"\\\\u00\";\n"
+        "          out += kHex[c >> 4];\n"
+        "          out += kHex[c & 0xF];\n"
+        "        } else {\n"
+        "          out += static_cast<char>(c);\n"
+        "        }\n"
+        "    }\n"
+        "  }\n"
+        "  out += '\"';\n"
+        "  return out;\n"
+        "}\n"
+        "\n"
+        "std::string SerializeToTOML() {\n",
+    ),
+    (
+        "src/core/cvar.cpp",
+        "    if (entry.getter() != entry.default_value) {\n"
+        "      if (entry.type == FlagType::String) {\n"
+        "        result += entry.name + \" = \\\"\" + entry.getter() + \"\\\"\\n\";\n",
+        "    if (entry.getter() != entry.default_value) {\n"
+        "      if (entry.type == FlagType::String) {\n"
+        "        result += entry.name + \" = \" + TomlQuote(entry.getter()) + \"\\n\";\n",
+    ),
+    (
+        "src/core/cvar.cpp",
+        "    if (entry.category == category && entry.getter() != entry.default_value) {\n"
+        "      if (entry.type == FlagType::String) {\n"
+        "        result += entry.name + \" = \\\"\" + entry.getter() + \"\\\"\\n\";\n",
+        "    if (entry.category == category && entry.getter() != entry.default_value) {\n"
+        "      if (entry.type == FlagType::String) {\n"
+        "        result += entry.name + \" = \" + TomlQuote(entry.getter()) + \"\\n\";\n",
+    ),
+]
+
+# SDK change 5: relocatable indirect-call tables for DLL modules too.
+# Each player DLL's table sat right after its image and overlapped the load
+# address of the next character (e.g. Alucard's table 0x83090000-0x830F0328 vs
+# Soma's image at 0x83090000). A DLL now exports ReXModule_TableBase(), and
+# the loader passes that address on; CMakeLists.txt gives every player DLL its
+# own slot from 0x8D000000.
+SDK_PATCHES += [
+    (
+        "resources/templates/codegen/register_cpp.inja",
+        "extern \"C\" REX_MODULE_EXPORT\n"
+        "void ReXModule_Register(rex::runtime::IModuleRegistrar* registrar) {\n",
+        "// Guest address of this module's indirect-call table (REX_FUNC_TABLE_BASE).\n"
+        "extern \"C\" REX_MODULE_EXPORT\n"
+        "uint32_t ReXModule_TableBase() {\n"
+        "  return static_cast<uint32_t>(REX_FUNC_TABLE_BASE);\n"
+        "}\n"
+        "\n"
+        "extern \"C\" REX_MODULE_EXPORT\n"
+        "void ReXModule_Register(rex::runtime::IModuleRegistrar* registrar) {\n",
+    ),
+    (
+        "src/system/kernel_state.cpp",
+        "        auto* xex = module->xex_module();\n",
+        "        // Where the module keeps its indirect-call table; 0 = right after\n"
+        "        // the image (modules generated before ReXModule_TableBase existed).\n"
+        "        uint32_t table_base = 0;\n"
+        "        using TableBaseFn = uint32_t (*)();\n"
+        "        if (auto table_base_func = reinterpret_cast<TableBaseFn>(\n"
+        "                library_local.GetSymbol(\"ReXModule_TableBase\"))) {\n"
+        "          table_base = table_base_func();\n"
+        "        }\n"
+        "        auto* xex = module->xex_module();\n",
+    ),
+    (
+        "src/system/kernel_state.cpp",
+        "text->address, text->size, xex->base_address(), xex->image_size())) {",
+        "text->address, text->size, xex->base_address(), xex->image_size(),\n"
+        "                       /*is_entrypoint=*/false, table_base)) {",
+    ),
+]
+
+# SDK change 6: stale handles in guest dispatcher headers.
+#
+# For guest-allocated KEVENTs / critical sections the SDK creates a host object
+# on first use and caches its handle in the guest header (wait_list_flink =
+# 'REX\0', wait_list_blink = handle). When the game frees that memory and later
+# reuses it (RtlInitializeCriticalSection does not clear those two words), the
+# cached handle may by then belong to a completely different object - a socket,
+# a thread - and waits, sets and ObDereferenceObject act on that object. In
+# Harmony of Despair online sessions this released the game's socket handle and
+# crashed in RtlEnterCriticalSection when a co-op map started. The cached handle
+# is now only used if it still refers to an object created for this header.
+SDK_PATCHES += [
+    (
+        "src/system/xobject.cpp",
+        "#include <vector>\n\n#include <rex/chrono/clock.h>\n",
+        "#include <mutex>\n#include <unordered_map>\n#include <vector>\n\n#include <rex/chrono/clock.h>\n",
+    ),
+    (
+        "src/system/xobject.cpp",
+        "object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,\n"
+        "                                             int32_t as_type) {\n",
+        "// Objects created by GetNativeObject, and the guest header each belongs to.\n"
+        "static std::mutex g_native_owner_mutex;\n"
+        "static std::unordered_map<const XObject*, const void*> g_native_owner;\n"
+        "\n"
+        "// True if the handle cached in a guest header still refers to the object that\n"
+        "// was created for that header (and not to an unrelated object that reused the\n"
+        "// handle number after the guest freed and recycled the memory).\n"
+        "static bool NativeHandleStillValid(KernelState* kernel_state, const XObject* object,\n"
+        "                                   const void* native_ptr, int32_t as_type) {\n"
+        "  XObject::Type expected;\n"
+        "  switch (as_type) {\n"
+        "    case 0:\n"
+        "    case 1:\n"
+        "      expected = XObject::Type::Event;\n"
+        "      break;\n"
+        "    case 2:\n"
+        "      expected = XObject::Type::Mutant;\n"
+        "      break;\n"
+        "    case 5:\n"
+        "      expected = XObject::Type::Semaphore;\n"
+        "      break;\n"
+        "    case 6:\n"
+        "      expected = XObject::Type::Thread;\n"
+        "      break;\n"
+        "    case 8:\n"
+        "    case 9:\n"
+        "      expected = XObject::Type::Timer;\n"
+        "      break;\n"
+        "    default:\n"
+        "      return true;  // unknown kind: keep the old behaviour\n"
+        "  }\n"
+        "  if (object->type() != expected) {\n"
+        "    return false;\n"
+        "  }\n"
+        "  if (object->guest_object() &&\n"
+        "      object->guest_object() == kernel_state->memory()->HostToGuestVirtual(native_ptr)) {\n"
+        "    return true;  // CreateNative object living in this header\n"
+        "  }\n"
+        "  std::lock_guard lock(g_native_owner_mutex);\n"
+        "  auto it = g_native_owner.find(object);\n"
+        "  return it != g_native_owner.end() && it->second == native_ptr;\n"
+        "}\n"
+        "\n"
+        "object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,\n"
+        "                                             int32_t as_type) {\n",
+    ),
+    (
+        "src/system/xobject.cpp",
+        "    uint32_t handle = header->wait_list_blink;\n"
+        "    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);\n"
+        "\n"
+        "    // TODO(benvanik): assert nothing has been changed in the struct.\n"
+        "    return object;\n"
+        "  } else {\n",
+        "    uint32_t handle = header->wait_list_blink;\n"
+        "    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);\n"
+        "    if (object && NativeHandleStillValid(kernel_state, object.get(), native_ptr, as_type)) {\n"
+        "      return object;\n"
+        "    }\n"
+        "    // Stale: the guest reused this memory. Create a fresh object below.\n"
+        "  }\n"
+        "  {\n",
+    ),
+    (
+        "src/system/xobject.cpp",
+        "    StashHandle(header, object->handle());\n"
+        "\n"
+        "    return object_ref<XObject>(object);\n",
+        "    StashHandle(header, object->handle());\n"
+        "    {\n"
+        "      std::lock_guard lock(g_native_owner_mutex);\n"
+        "      g_native_owner[object] = native_ptr;\n"
+        "    }\n"
+        "\n"
+        "    return object_ref<XObject>(object);\n",
+    ),
+]
+
+PATCH_STAMP = SDK_DIR / ".harmonyrecomp-patches"
+
+
+def sdk_patch_hash() -> str:
+    h = hashlib.sha256()
+    for rel, old, new in SDK_PATCHES:
+        h.update(rel.encode() + b"\0" + old.encode() + b"\0" + new.encode() + b"\0")
+    return h.hexdigest()[:16]
+
+
+def apply_sdk_patches() -> None:
+    applied = 0
+    for rel, old, new in SDK_PATCHES:
+        path = SDK_DIR / rel
+        data = path.read_bytes().decode("utf-8")
+        crlf = "\r\n" in data
+        o = old.replace("\n", "\r\n") if crlf else old
+        n = new.replace("\n", "\r\n") if crlf else new
+        if n in data:
+            continue  # already applied
+        if data.count(o) != 1:
+            sys.exit(f"error: SDK patch does not fit {rel}; is the SDK at the commit in sdk-pin.txt?")
+        path.write_bytes(data.replace(o, n, 1).encode("utf-8"))
+        applied += 1
+    if applied:
+        print(f"      applied {applied} local SDK change(s) (see SDK_PATCHES in build.py)")
+
+def step_clone_sdk() -> None:
+    url, commit = read_pin()
+    if (SDK_DIR / "CMakeLists.txt").exists():
+        print(f"[2/5] SDK already at {SDK_DIR}, skipping clone")
+        n = resolve_symlink_placeholders(SDK_DIR)
+        if n:
+            print(f"      replaced {n} symlink placeholder file(s) with real copies")
+        apply_sdk_patches()
+        return
+    print(f"[2/5] Cloning ReXGlue SDK {commit[:12]}")
+    SDK_DIR.mkdir(parents=True, exist_ok=True)
+    run(git("init", "-q"), cwd=SDK_DIR)
+    run(git("remote", "add", "origin", url), cwd=SDK_DIR)
+    run(git("fetch", "--depth", "1", "origin", commit), cwd=SDK_DIR)
+    run(git("checkout", "-q", "FETCH_HEAD"), cwd=SDK_DIR)
+    run(git("submodule", "update", "--init", "--depth", "1", "--jobs", "8"), cwd=SDK_DIR)
+    n = resolve_symlink_placeholders(SDK_DIR)
+    if n:
+        print(f"      replaced {n} symlink placeholder file(s) with real copies")
+    apply_sdk_patches()
+
+
+def sdk_install_dir(pid: str) -> Path:
+    return SDK_DIR / "out" / "install" / pid
+
+
+def find_rexglue(pid: str) -> Path | None:
+    exe = "rexglue.exe" if platform.system() == "Windows" else "rexglue"
+    for base in (sdk_install_dir(pid), SDK_DIR / "out" / pid):
+        for candidate in base.rglob(exe):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def stale_cmake_cache(build_dir: Path) -> bool:
+    """True if build_dir was configured for a different SDK source folder."""
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return False
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("CMAKE_HOME_DIRECTORY:"):
+            recorded = line.split("=", 1)[1].strip()
+
+            def norm(p) -> str:
+                return os.path.normcase(os.path.normpath(str(p)))
+
+            return norm(recorded) != norm(SDK_DIR.resolve())
+    return False
+
+
+def reembed_codegen_templates(build_dir: Path) -> None:
+    """Regenerate the codegen templates compiled into the rexglue tool.
+
+    The SDK embeds resources/templates/**/*.inja into C++ headers through a
+    custom command that Ninja Multi-Config attaches to a single configuration,
+    so an incremental build of another configuration can keep stale templates.
+    Running the embed script directly refreshes them; the compiler's header
+    dependencies then rebuild the code that includes them.
+    """
+    out_dir = build_dir / "src" / "codegen" / "generated" / "templates"
+    if not out_dir.is_dir():
+        return  # fresh build: the custom command generates them
+    run(["cmake",
+         f"-DTEMPLATE_SOURCE_DIR={SDK_DIR / 'resources' / 'templates'}",
+         f"-DTEMPLATE_OUTPUT_DIR={out_dir}",
+         "-P", SDK_DIR / "cmake" / "embed_templates.cmake"], cwd=SDK_DIR)
+
+
+def step_build_sdk(pid: str, config: str) -> Path:
+    tool = find_rexglue(pid)
+    stamp_ok = PATCH_STAMP.exists() and PATCH_STAMP.read_text().strip() == sdk_patch_hash()
+    if tool and (sdk_install_dir(pid) / "lib").exists() and stamp_ok:
+        print(f"[3/5] SDK already built ({tool}), skipping")
+        return tool
+    build_dir = SDK_DIR / "out" / "build" / pid
+    if stale_cmake_cache(build_dir):
+        # CMake remembers the absolute source path; after the SDK folder was
+        # moved, the old build tree cannot be reused and must be rebuilt.
+        print(f"[3/5] SDK build folder belongs to an old location, removing {build_dir}")
+        shutil.rmtree(build_dir)
+        tool = None
+    if tool:
+        print("[3/5] SDK changed, rebuilding (incremental, only the changed parts)")
+    else:
+        print("[3/5] Building and installing the ReXGlue SDK (this takes a while)")
+    # The SDK uses one multi-config configure preset per platform (e.g.
+    # "win-amd64") plus build presets "<platform>-<config>".
+    run(["cmake", "--preset", pid], cwd=SDK_DIR)
+    reembed_codegen_templates(build_dir)
+    run(["cmake", "--build", "--preset", f"{pid}-{config.lower()}"], cwd=SDK_DIR)
+    run(["cmake", "--install", f"out/build/{pid}", "--config", config], cwd=SDK_DIR)
+    PATCH_STAMP.write_text(sdk_patch_hash() + "\n")
+    tool = find_rexglue(pid)
+    if tool is None:
+        sys.exit("error: SDK built, but the rexglue tool was not found")
+    return tool
+
+
+CODEGEN_STAMP = ROOT / "generated" / ".harmonyrecomp-codegen"
+
+
+def codegen_inputs_hash() -> str:
+    """Hash of everything codegen output depends on besides the game binary:
+    the manifest, every config file it includes, and the SDK changes."""
+    h = hashlib.sha256(sdk_patch_hash().encode())
+    files = [MANIFEST, *sorted(ROOT.glob("harmonyrecomp_*.toml"))]  # includes the local manifest
+    for path in dict.fromkeys(files):
+        h.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()[:16]
+
+
+def check_codegen_output() -> None:
+    """Every player DLL must report its table address (SDK change 5), or the
+    loader and the DLL's own code would disagree about where the table is."""
+    for manifest_line in active_manifest().read_text(encoding="utf-8").splitlines():
+        line = manifest_line.strip()
+        if not line.startswith('out_directory_path = "generated/dll'):
+            continue
+        out_dir = ROOT / line.split('"')[1]
+        register = out_dir / "harmonyrecomp_register.cpp"
+        text = register.read_text(encoding="utf-8") if register.exists() else ""
+        if "ReXModule_TableBase" not in text:
+            sys.exit(
+                f"error: {register.relative_to(ROOT)} lacks ReXModule_TableBase.\n"
+                "  The rexglue tool still uses old codegen templates. Delete the folder\n"
+                f"  {SDK_DIR / 'out'} and run build.py again for a clean SDK build."
+            )
+
+
+def step_codegen(tool: Path, force: bool) -> None:
+    done = (ROOT / "generated" / "default" / "sources.cmake").exists()
+    current = codegen_inputs_hash()
+    up_to_date = (done and CODEGEN_STAMP.exists()
+                  and CODEGEN_STAMP.read_text().strip() == current)
+    if up_to_date and not force:
+        print("[4/5] Codegen output up to date, skipping (use --force-codegen to redo)")
+        check_codegen_output()
+        return
+    if done and not force:
+        print("[4/5] Codegen config or SDK changed, running codegen again (about 2 minutes)")
+    else:
+        print("[4/5] Running codegen (about 2 minutes)")
+    run([tool, "codegen", active_manifest()], cwd=ROOT)
+    check_codegen_output()
+    CODEGEN_STAMP.write_text(current + "\n")
+
+
+def step_build_game(pid: str, config: str) -> None:
+    preset = f"{pid}-{config.lower()}"
+    print(f"[5/5] Building the game ({preset})")
+    prefix = sdk_install_dir(pid)
+    run(["cmake", "--preset", preset, f"-DCMAKE_PREFIX_PATH={prefix}"], cwd=ROOT)
+    run(["cmake", "--build", f"out/build/{preset}"], cwd=ROOT)
+    out_dir = ROOT / "out" / "build" / preset
+    runtime_cfg = out_dir / "harmonyrecomp.toml"
+    if not runtime_cfg.exists():
+        # Runtime settings read at startup (e.g. license_mask). Copied only
+        # once, so your own edits next to the exe are kept.
+        shutil.copy2(ROOT / "harmonyrecomp.toml", runtime_cfg)
+        print(f"      wrote {runtime_cfg}")
+    print(f"\nDone. Output is in {out_dir}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--debug", action="store_true", help="debug instead of release build")
+    parser.add_argument("--codegen-only", action="store_true", help="stop after codegen")
+    parser.add_argument("--force-codegen", action="store_true", help="rerun codegen")
+    args = parser.parse_args()
+
+    check_tools()
+    pid = platform_id()
+    config = "Debug" if args.debug else "Release"
+
+    step_extract()
+    step_dlc()
+    step_clone_sdk()
+    tool = step_build_sdk(pid, config)
+    step_codegen(tool, args.force_codegen)
+    if args.codegen_only:
+        return 0
+    step_build_game(pid, config)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,24 @@
+# Your own game files: never commit or share these
+game/
+assets/
+dlc/
+
+# Codegen output (derived from the game binary), local manifest with your DLC,
+# and build trees
+generated/*/
+generated/.harmonyrecomp-codegen
+harmonyrecomp_manifest.local.toml
+out/
+thirdparty/
+
+# Logs, archives and editor / Python leftovers
+build.log
+*.log
+*.rar
+*.zip
+*.7z
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/

@@ -1,0 +1,138 @@
+# harmonyrecomp - ReXGlue codegen config for Castlevania: Harmony of Despair (XBLA)
+#
+# Title ID 58410A7A, default.xex (original PE name dcHD_Master.exe),
+# version 0x00000104, XDK libraries 2.0.9328.0, image 0x82000000-0x82960000.
+#
+# Add named functions (indirect-call targets), midasm hooks, and CRT
+# addresses here once they are located in assets/default.xex.
+#
+# Example:
+#   [functions]
+#   0x8XXXXXXX = {name = "MyFunction"}
+#
+#   [[midasm_hook]]
+#   address = 0x8XXXXXXX
+#   name = "MyHook"
+#   registers = ["r3"]
+#   return = true
+#
+#   [rexcrt]
+#   memcpy  = 0x8XXXXXXX
+#   memset  = 0x8XXXXXXX
+#   memmove = 0x8XXXXXXX
+
+# XDK CRT memory routines, replaced with native host versions.
+# memcpy  sub_8273A030 (1215 call sites): saves r3 for the return value, aligns
+#         dst to 8 bytes with a byte loop, dcbt/dcbtst prefetch, ld/std block
+#         copy, byte tail. No overlap check.
+# memmove sub_8273AD00 (22 call sites): cmpw r3,r4 / beqlr / forward case is a
+#         tail branch to memcpy 0x8273A030, otherwise a backward copy.
+# memset  sub_8273A590 (610 call sites): byte stores up to 4-byte alignment,
+#         then broadcasts the fill byte (rlwimi r4,r4,8,16,23 / 16,0,15) and
+#         stores 16-byte blocks.
+[rexcrt]
+memcpy  = 0x8273A030
+memmove = 0x8273AD00
+memset  = 0x8273A590
+
+[functions]
+# C++ multiple-inheritance adjustor thunk (this -= 8, then tail-branch).
+# Its neighbours 0x82644498 / 0x826444A0 / 0x826444B0 have the same shape and
+# were found automatically; this one is only reached by the tail branch at
+# 0x826444B4, so the first codegen pass left it unresolved.
+0x826444A8 = {}
+
+# sub_8277ECF0 ends where sub_8277EE40 (its own prologue, 6 bl call sites)
+# begins. The over-long jump table below made the scanner extend it to
+# 0x8277F134; fixing the table alone does not shrink the boundary.
+0x8277ECF0 = { end = 0x8277EE40 }
+
+# Functions only reachable through pointers, found by scanning the code gaps
+# the first codegen pass left behind (first launch crashed with
+# 'Call to invalid or unregistered function at guest address 0x822130A8').
+#
+# a) Compiler thunks, matched by instruction pattern:
+#    vcall thunk     lwz rX,0(r3) ; lwz rY,N(rX) ; mtctr rY ; bctr
+#    adjustor thunk  addi r3,r3,imm ; b target
+#    They are called through member-function pointers built in code, so no
+#    pointer to them exists in the data sections.
+0x82213038 = {}
+0x82213048 = {}
+0x82213058 = {}
+0x82213068 = {}
+0x82213078 = {}
+0x82213088 = {}
+0x82213098 = {}
+0x822130A8 = {}   # the address of the first launch crash
+0x822130B8 = {}
+0x825A7E40 = {}
+0x825F5088 = {}
+0x825F5098 = {}
+0x825F50A8 = {}
+0x825F50B8 = {}
+0x825F50C8 = {}
+0x82647CD0 = {}
+0x82647CD8 = {}
+0x8264C8A8 = {}
+0x8264C8B0 = {}
+0x8264C8B8 = {}
+0x8264C8C0 = {}
+0x8264C8C8 = {}
+0x8264C8D0 = {}
+0x8264C8E0 = {}
+0x8264C8E8 = {}
+0x8264C8F0 = {}
+0x8264C8F8 = {}
+0x8264CB78 = {}
+0x8264CB88 = {}
+0x8264CB90 = {}
+0x8264CB98 = {}
+0x8264CBA0 = {}
+0x8264DFA0 = {}
+0x8264ED10 = {}
+0x82661580 = {}
+#
+# b) Small functions referenced by pointers in .rdata/.data (vtables,
+#    callback tables). Kept only if the target follows a return or padding
+#    and ends in blr/bctr/b within 64 instructions.
+0x822B8408 = {}
+0x8239BDA0 = {}
+0x824552C0 = {}
+0x824B08D0 = {}
+0x824EC6E8 = {}
+0x8258B4F8 = {}
+0x8259FF48 = {}
+0x825B3260 = {}
+0x825B9BC0 = {}
+0x825C1E40 = {}
+0x825E5B08 = {}
+0x825E6600 = {}
+0x825ED618 = {}
+0x825ED698 = {}
+0x825F3398 = {}
+0x826410CC = {}
+0x8264D278 = {}
+0x82651A78 = {}
+
+# sub_8277ECF0: byte-indexed jump table with no bounds check.
+#   lwz r11,240(r3) ; addi r11,r11,-1        index = message type - 1
+#   lbzx r0,(0x82068E90 + r11) ; r0 <<= 2    one byte per case
+#   ctr = 0x8277ED38 + r0 ; bctr @ 0x8277ED34
+# Without a bounds check codegen read past the table into the next function.
+# The table has 16 entries (types 1..16); the bytes, read from guest memory at
+# runtime, are
+#   0C 0C 0C 0C 42 0C 0C 0C 0C 00 0C 0C 00 00 00 00
+# 0x0C -> 0x8277ED68 (plain cleanup), 0x00 -> 0x8277ED38 (also releases the
+# connection at +308), 0x42 -> 0x8277EE40 = sub_8277EE40 (tail call).
+# An earlier hand-written version was off by one from entry 8 on, which sent
+# type 12 (data received, no connection when the host sends to itself) to
+# 0x8277ED38 and crashed with a null connection when hosting a session.
+[[switch_tables]]
+address = 0x8277ED34
+register = 11
+labels = [
+  0x8277ED68, 0x8277ED68, 0x8277ED68, 0x8277ED68, # 0-3   types 1-4
+  0x8277EE40, 0x8277ED68, 0x8277ED68, 0x8277ED68, # 4-7   types 5-8
+  0x8277ED68, 0x8277ED38, 0x8277ED68, 0x8277ED68, # 8-11  types 9-12
+  0x8277ED38, 0x8277ED38, 0x8277ED38, 0x8277ED38, # 12-15 types 13-16
+]

@@ -1,0 +1,21 @@
+# Runtime settings for harmonyrecomp.exe. scripts/build.py copies this file next
+# to the exe once; edit the copy there to change settings.
+
+# XBLA license state reported to the game by XamContentGetLicenseMask.
+# 0 = no license: the game runs as the trial version. 1 = full game.
+# Use this for your own purchased copy (the license itself stays on your Xbox
+# account, so the recompiled game cannot read it).
+license_mask = 1
+
+# ---- Online co-op (LAN / virtual LAN) ---------------------------------------
+# Off by default. Every player needs it on and a unique name. Over the
+# internet use a virtual LAN: Radmin VPN or ZeroTier (lobbies are found
+# automatically) or Tailscale (then list the other players in netplay_peers).
+netplay_enabled = false
+netplay_name = ""
+# Address others reach you on; empty = automatic (prefers VPN adapters).
+# netplay_ip = "26.12.34.56"
+# Other players, if broadcasts do not reach them: "ip" or "ip:port", comma separated.
+# netplay_peers = "26.98.76.54"
+# UDP port of the lobby service (allow it in the firewall).
+# netplay_port = 47658
