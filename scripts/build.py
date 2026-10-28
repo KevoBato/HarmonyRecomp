@@ -17,7 +17,13 @@ Usage:
   python scripts/build.py --codegen-only  # stop after step 4
   python scripts/build.py --force-codegen # rerun codegen even if output exists
 
-Requirements (Windows): scoop install llvm cmake ninja git python
+Requirements (Windows), either:
+  python scripts/toolchain.py fetch       # portable tools, no Visual Studio needed
+or:
+  scoop install llvm cmake ninja git python  (plus Visual Studio Build Tools)
+
+The portable tools are used automatically once they are fetched; pick one with
+--toolchain portable / --toolchain system.
 """
 
 from __future__ import annotations
@@ -30,6 +36,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import toolchain  # noqa: E402  (scripts/ is not a package)
 
 ROOT = Path(__file__).resolve().parents[1]
 # The SDK must live OUTSIDE the project folder: before codegen, rexglue scans
@@ -48,6 +57,12 @@ DLC_ASSETS = ROOT / "assets" / "dlc"
 # plus one [[modules]] entry per DLC player DLL. Generated, not committed.
 LOCAL_MANIFEST = ROOT / "harmonyrecomp_manifest.local.toml"
 TITLE_ID = 0x58410A7A
+# Which tools configure the build trees: "system" (whatever is on PATH, with an
+# installed Visual Studio) or "portable" (scripts/toolchain.py). CMake caches
+# compiler and library paths, so a tree configured with one is not reused with
+# the other.
+TOOLCHAIN = "system"
+TOOLCHAIN_STAMP_NAME = ".harmonyrecomp-toolchain"
 
 
 def run(args, cwd=None):
@@ -79,12 +94,47 @@ def platform_id() -> str:
     sys.exit(f"error: unsupported architecture {arch}")
 
 
+def use_toolchain(choice: str) -> None:
+    global TOOLCHAIN
+    if choice == "auto":
+        choice = "portable" if platform.system() == "Windows" and toolchain.ready() else "system"
+    if choice == "portable":
+        if not toolchain.ready():
+            sys.exit("error: the portable build tools are missing\n"
+                     "  run: python scripts/toolchain.py fetch")
+        os.environ.update(toolchain.environment())
+        print(f"[0/5] Using the portable build tools in {toolchain.tools_dir()}")
+    TOOLCHAIN = choice
+
+
+def reset_if_other_toolchain(build_dir: Path) -> bool:
+    """Remove build_dir if another toolchain configured it. A tree from before
+    the portable tools existed has no stamp and counts as "system"."""
+    stamp = build_dir / TOOLCHAIN_STAMP_NAME
+    if stamp.exists():
+        recorded = stamp.read_text().strip()
+    elif (build_dir / "CMakeCache.txt").exists():
+        recorded = "system"
+    else:
+        return False
+    if recorded == TOOLCHAIN:
+        return False
+    print(f"      {build_dir} was configured with the {recorded} tools, removing it")
+    shutil.rmtree(build_dir)
+    return True
+
+
+def mark_toolchain(build_dir: Path) -> None:
+    (build_dir / TOOLCHAIN_STAMP_NAME).write_text(TOOLCHAIN + "\n")
+
+
 def check_tools() -> None:
     missing = [t for t in ("cmake", "ninja", "git", "clang++") if shutil.which(t) is None]
     if missing:
         sys.exit(
             "error: missing tool(s): " + ", ".join(missing) +
-            "\n  Windows: scoop install llvm cmake ninja git"
+            "\n  Windows: python scripts/toolchain.py fetch"
+            "\n  (or: scoop install llvm cmake ninja git, plus Visual Studio Build Tools)"
         )
 
 
@@ -691,6 +741,10 @@ SDK_PATCHES += [
 ]
 
 PATCH_STAMP = SDK_DIR / ".harmonyrecomp-patches"
+# A prebuilt SDK is only out/install/<platform> plus this stamp, without the
+# sources (the launcher package ships one, see make_launcher_package.py). It
+# records the commit, SDK changes and toolchain it was built with.
+PREBUILT_STAMP = SDK_DIR / ".harmonyrecomp-prebuilt"
 
 
 def sdk_patch_hash() -> str:
@@ -717,8 +771,25 @@ def apply_sdk_patches() -> None:
     if applied:
         print(f"      applied {applied} local SDK change(s) (see SDK_PATCHES in build.py)")
 
-def step_clone_sdk() -> None:
+def prebuilt_stamp_text() -> str:
+    return f"{read_pin()[1]} {sdk_patch_hash()} {TOOLCHAIN}"
+
+
+def prebuilt_sdk_ok(pid: str) -> bool:
+    """True for a prebuilt SDK that matches the pinned commit, the current SDK
+    changes and the toolchain. Otherwise the SDK is cloned and built as usual
+    (into the same folder, replacing the prebuilt files)."""
+    if (SDK_DIR / "CMakeLists.txt").exists() or not PREBUILT_STAMP.exists():
+        return False
+    return (PREBUILT_STAMP.read_text().strip() == prebuilt_stamp_text()
+            and find_rexglue(pid) is not None)
+
+
+def step_clone_sdk(pid: str) -> None:
     url, commit = read_pin()
+    if prebuilt_sdk_ok(pid):
+        print(f"[2/5] Using the prebuilt SDK in {SDK_DIR}, no clone needed")
+        return
     if (SDK_DIR / "CMakeLists.txt").exists():
         print(f"[2/5] SDK already at {SDK_DIR}, skipping clone")
         n = resolve_symlink_placeholders(SDK_DIR)
@@ -788,11 +859,20 @@ def reembed_codegen_templates(build_dir: Path) -> None:
 
 def step_build_sdk(pid: str, config: str) -> Path:
     tool = find_rexglue(pid)
-    stamp_ok = PATCH_STAMP.exists() and PATCH_STAMP.read_text().strip() == sdk_patch_hash()
+    if prebuilt_sdk_ok(pid):
+        print(f"[3/5] Prebuilt SDK ({tool}), skipping the SDK build")
+        return tool
+    # The stamp records the SDK changes and the toolchain the SDK was built
+    # with; a stamp with only the hash predates the portable tools.
+    stamp = PATCH_STAMP.read_text().strip() if PATCH_STAMP.exists() else ""
+    stamp_ok = (stamp == f"{sdk_patch_hash()} {TOOLCHAIN}"
+                or (TOOLCHAIN == "system" and stamp == sdk_patch_hash()))
     if tool and (sdk_install_dir(pid) / "lib").exists() and stamp_ok:
         print(f"[3/5] SDK already built ({tool}), skipping")
         return tool
     build_dir = SDK_DIR / "out" / "build" / pid
+    if reset_if_other_toolchain(build_dir):
+        tool = None
     if stale_cmake_cache(build_dir):
         # CMake remembers the absolute source path; after the SDK folder was
         # moved, the old build tree cannot be reused and must be rebuilt.
@@ -806,10 +886,11 @@ def step_build_sdk(pid: str, config: str) -> Path:
     # The SDK uses one multi-config configure preset per platform (e.g.
     # "win-amd64") plus build presets "<platform>-<config>".
     run(["cmake", "--preset", pid], cwd=SDK_DIR)
+    mark_toolchain(build_dir)
     reembed_codegen_templates(build_dir)
     run(["cmake", "--build", "--preset", f"{pid}-{config.lower()}"], cwd=SDK_DIR)
     run(["cmake", "--install", f"out/build/{pid}", "--config", config], cwd=SDK_DIR)
-    PATCH_STAMP.write_text(sdk_patch_hash() + "\n")
+    PATCH_STAMP.write_text(f"{sdk_patch_hash()} {TOOLCHAIN}\n")
     tool = find_rexglue(pid)
     if tool is None:
         sys.exit("error: SDK built, but the rexglue tool was not found")
@@ -869,9 +950,11 @@ def step_build_game(pid: str, config: str) -> None:
     preset = f"{pid}-{config.lower()}"
     print(f"[5/5] Building the game ({preset})")
     prefix = sdk_install_dir(pid)
-    run(["cmake", "--preset", preset, f"-DCMAKE_PREFIX_PATH={prefix}"], cwd=ROOT)
-    run(["cmake", "--build", f"out/build/{preset}"], cwd=ROOT)
     out_dir = ROOT / "out" / "build" / preset
+    reset_if_other_toolchain(out_dir)
+    run(["cmake", "--preset", preset, f"-DCMAKE_PREFIX_PATH={prefix}"], cwd=ROOT)
+    mark_toolchain(out_dir)
+    run(["cmake", "--build", f"out/build/{preset}"], cwd=ROOT)
     runtime_cfg = out_dir / "harmonyrecomp.toml"
     if not runtime_cfg.exists():
         # Runtime settings read at startup (e.g. license_mask). Copied only
@@ -887,15 +970,19 @@ def main() -> int:
     parser.add_argument("--debug", action="store_true", help="debug instead of release build")
     parser.add_argument("--codegen-only", action="store_true", help="stop after codegen")
     parser.add_argument("--force-codegen", action="store_true", help="rerun codegen")
+    parser.add_argument("--toolchain", choices=("auto", "portable", "system"), default="auto",
+                        help="portable: tools from scripts/toolchain.py; system: tools on PATH; "
+                             "auto (default): portable once fetched")
     args = parser.parse_args()
 
+    use_toolchain(args.toolchain)
     check_tools()
     pid = platform_id()
     config = "Debug" if args.debug else "Release"
 
     step_extract()
     step_dlc()
-    step_clone_sdk()
+    step_clone_sdk(pid)
     tool = step_build_sdk(pid, config)
     step_codegen(tool, args.force_codegen)
     if args.codegen_only:

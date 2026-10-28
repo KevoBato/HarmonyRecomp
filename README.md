@@ -29,13 +29,52 @@ The PowerPC code of `default.xex` and the character modules is translated to C++
 
 - Windows 10/11, x86-64
 - Your own XBLA package of the game (the file without extension in `58410A7A/000D0000/`, it starts with `LIVE`)
-- Build tools, e.g. with [Scoop](https://scoop.sh) in PowerShell:
+- About 15 GB of free space (build tools, SDK and build)
 
-  ```powershell
-  scoop install llvm cmake ninja git python
-  ```
+## Easiest way: the launcher
 
-  The SDK needs **Clang 20 or newer** (`clang++ --version`).
+`HarmonyLauncher.exe` does everything below with buttons: choose your game file (and DLC), press **BUILD**, then **PLAY**.
+
+- It checks that the file really is Harmony of Despair (title ID `58410A7A`) before building.
+- On the first build it downloads about 850 MB of portable build tools into folders next to itself (see [Portable build tools](#portable-build-tools)). **Nothing is installed on your system** and no administrator rights or Visual Studio are needed. With the prebuilt SDK from `HarmonyLauncher.zip` the first build takes a few minutes after the download (20 to 40 if the SDK has to be compiled); later builds only redo what changed.
+- The **Settings** tab edits `harmonyrecomp.toml`: fullscreen, full game / trial, and online co-op (name, peers).
+- The full build output is in `launcher.log` next to the launcher and on the **Build log** tab.
+
+Put the launcher in an empty folder of its own (not `Program Files`), e.g. `C:\Games\HarmonyRecomp\`. Placed inside a clone of this repository it builds that clone instead.
+
+To build the launcher yourself (needs the .NET 10 SDK):
+
+```powershell
+dotnet publish launcher -c Release
+# -> launcher\bin\Release\net10.0\win-x64\publish\HarmonyLauncher.exe (single file, no .NET needed to run it)
+```
+
+To make the zip players download (launcher + this repository + a **prebuilt SDK**, so their first build skips the SDK and takes minutes instead of half an hour):
+
+```powershell
+python scripts\build.py --toolchain portable    # once: builds the SDK with the portable tools
+python scripts\make_launcher_package.py         # -> ..\HarmonyLauncher.zip (about 60 MB)
+```
+
+The package holds no game files and no code derived from the game. `build.py` uses the bundled SDK only while it matches `sdk-pin.txt`, the SDK patches and the toolchain; otherwise it clones and builds the SDK as usual.
+
+## Portable build tools
+
+`scripts\toolchain.py` downloads everything the build needs into `..\harmonyrecomp-tools\`, next to this folder:
+
+```powershell
+python scripts\toolchain.py fetch
+```
+
+LLVM/Clang 20, CMake, Ninja, MinGit and 7-Zip come from their official GitHub releases. The Microsoft C/C++ runtime headers and libraries (three `.vsix` packages from Microsoft's Visual Studio CDN) and the Windows SDK (two packages from nuget.org) are downloaded from Microsoft on your own PC; this repository never redistributes them. Every file is pinned with its size and SHA-256/SHA-512 in `toolchain.lock.json` and checked before it is unpacked. Once fetched, `build.py` uses these tools automatically (`--toolchain portable` / `--toolchain system` to choose).
+
+Alternatively install the tools system-wide, e.g. with [Scoop](https://scoop.sh), plus Visual Studio Build Tools with the C++ workload:
+
+```powershell
+scoop install llvm cmake ninja git python
+```
+
+The SDK needs **Clang 20 or newer** (`clang++ --version`).
 
 ## Building
 
@@ -56,7 +95,7 @@ The PowerPC code of `default.xex` and the character modules is translated to C++
 4. Run codegen (about 2 minutes), output in `generated\`
 5. Build the game into `out\build\win-amd64-release\`
 
-Options: `--debug`, `--codegen-only`, `--force-codegen`. Codegen reruns automatically when the manifest, a `harmonyrecomp_*.toml`, the DLC set or the SDK patches change.
+Options: `--debug`, `--codegen-only`, `--force-codegen`, `--toolchain auto|portable|system`. Codegen reruns automatically when the manifest, a `harmonyrecomp_*.toml`, the DLC set or the SDK patches change.
 
 ## Running
 
@@ -137,6 +176,8 @@ DLC support has been tested with the build and installation pipeline, but not ye
 | `src/` | Host code: app, graphics menu, crash reports, runtime fixes, DLC installation |
 | `src/netplay/` | Online co-op: Live replacement, sessions, lobby service, game sockets |
 | `scripts/build.py` | Complete build, including the SDK patches |
+| `scripts/toolchain.py`, `toolchain.lock.json` | Portable build tools (no Visual Studio), pinned by checksum |
+| `launcher/` | `HarmonyLauncher.exe` (C#, Avalonia): choose game/DLC, build, settings, play |
 | `scripts/extract_game.py` | STFS package extractor (game and DLC) |
 | `sdk-pin.txt` | SDK commit the project is tested with |
 

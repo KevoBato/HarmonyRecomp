@@ -11,6 +11,11 @@ harmonyrecomp_manifest.local.toml
 out/
 thirdparty/
 
+# Launcher build output and the launcher's own files when run from the repo
+launcher/bin/
+launcher/obj/
+launcher.json
+
 # Logs, archives and editor / Python leftovers
 build.log
 *.log

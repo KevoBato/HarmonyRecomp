@@ -1,0 +1,123 @@
+{
+    "comment": "Portable build tools for scripts/toolchain.py and the launcher. Every file is downloaded from its official source and checked against the digest below; nothing is installed system-wide. The Microsoft C++ runtime headers/libraries and the Windows SDK come straight from Microsoft (Visual Studio CDN and nuget.org) on the user's PC and are never redistributed.",
+    "version": 1,
+    "tools": [
+        {
+            "name": "7zr.exe",
+            "url": "https://github.com/ip7z/7zip/releases/download/26.05/7zr.exe",
+            "sha256": "9bf582b894dfa665f852d7e9112b02290a1c303c2d95a21fcdc41ffcb03143b7",
+            "size": 602624,
+            "kind": "file",
+            "dest": "7zip-bootstrap",
+            "probe": "7zip-bootstrap/7zr.exe"
+        },
+        {
+            "name": "7z2605-x64.exe",
+            "url": "https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.exe",
+            "sha256": "fd99e86f57d8f429ef5ed045bf98315af962e2309b0f1ba87a147a44c71647d0",
+            "size": 1663506,
+            "kind": "7z",
+            "extractor": "7zip-bootstrap/7zr.exe",
+            "dest": "7zip",
+            "probe": "7zip/7z.exe"
+        },
+        {
+            "name": "cmake-4.4.4-windows-x86_64.zip",
+            "url": "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip",
+            "sha256": "bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536",
+            "size": 54400562,
+            "kind": "zip",
+            "prefix": "cmake-4.4.4-windows-x86_64/",
+            "dest": "cmake",
+            "probe": "cmake/bin/cmake.exe"
+        },
+        {
+            "name": "ninja-win.zip",
+            "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+            "sha256": "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65",
+            "size": 291570,
+            "kind": "zip",
+            "dest": "ninja",
+            "probe": "ninja/ninja.exe"
+        },
+        {
+            "name": "MinGit-2.56.0.4-64-bit.zip",
+            "url": "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/MinGit-2.56.0.4-64-bit.zip",
+            "sha256": "e3bf78351fe777fba47ddee5950082f8a98bb0f02604fdc7ba3ee2cb68ffa877",
+            "size": 39846926,
+            "kind": "zip",
+            "dest": "git",
+            "probe": "git/cmd/git.exe"
+        },
+        {
+            "name": "LLVM-20.1.8-win64.exe",
+            "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-win64.exe",
+            "sha256": "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b",
+            "size": 385658654,
+            "kind": "7z",
+            "extractor": "7zip/7z.exe",
+            "dest": "llvm",
+            "probe": "llvm/bin/clang++.exe"
+        },
+        {
+            "name": "Microsoft.VC.14.44.17.14.CRT.Headers.base.vsix",
+            "url": "https://download.visualstudio.microsoft.com/download/pr/c610cd8c-801b-44b8-a80a-82cc382aeb43/852382a9aa73502b7849c1bcadfb603ba7175c4e8b60e6aba03c7de711d4ece5/Microsoft.VC.14.44.17.14.CRT.Headers.base.vsix",
+            "sha256": "852382a9aa73502b7849c1bcadfb603ba7175c4e8b60e6aba03c7de711d4ece5",
+            "size": 2116223,
+            "kind": "zip",
+            "prefix": "Contents/",
+            "dest": "msvc",
+            "probe": "msvc/VC/Tools/MSVC/14.44.35207/include/vcruntime.h"
+        },
+        {
+            "name": "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base.vsix",
+            "url": "https://download.visualstudio.microsoft.com/download/pr/67cf767c-5e71-47c2-a54a-cd5631e28942/f01f701a7bcd9587a340898c851424f6a52bb913a70c185ff0d5bf0288c5831a/Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base.vsix",
+            "sha256": "f01f701a7bcd9587a340898c851424f6a52bb913a70c185ff0d5bf0288c5831a",
+            "size": 50776097,
+            "kind": "zip",
+            "prefix": "Contents/",
+            "dest": "msvc",
+            "probe": "msvc/VC/Tools/MSVC/14.44.35207/lib/x64/libcmt.lib"
+        },
+        {
+            "name": "Microsoft.VC.14.44.17.14.CRT.x64.Store.base.vsix",
+            "url": "https://download.visualstudio.microsoft.com/download/pr/67cf767c-5e71-47c2-a54a-cd5631e28942/9135b03c0df53c7a0aa9bef7230a1c2ff4263a0ee7baa7e419d034f484f6bb56/Microsoft.VC.14.44.17.14.CRT.x64.Store.base.vsix",
+            "sha256": "9135b03c0df53c7a0aa9bef7230a1c2ff4263a0ee7baa7e419d034f484f6bb56",
+            "size": 27596908,
+            "kind": "zip",
+            "prefix": "Contents/",
+            "dest": "msvc",
+            "probe": "msvc/VC/Tools/MSVC/14.44.35207/lib/x64/msvcrt.lib"
+        },
+        {
+            "name": "microsoft.windows.sdk.cpp.10.0.26100.8249.nupkg",
+            "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp/10.0.26100.8249/microsoft.windows.sdk.cpp.10.0.26100.8249.nupkg",
+            "sha512": "c159cde4a043b71ad30b7f197290cc52c19e21b914063849fb6041d405f413a630525b9da8e41486ff4ec6264497205b2c8fc473246ddb464f8f7d832dc4e1ac",
+            "size": 160432822,
+            "kind": "zip",
+            "prefix": "c/",
+            "dest": "winsdk",
+            "probe": "winsdk/Include/10.0.26100.0/um/windows.h"
+        },
+        {
+            "name": "microsoft.windows.sdk.cpp.x64.10.0.26100.8249.nupkg",
+            "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.cpp.x64/10.0.26100.8249/microsoft.windows.sdk.cpp.x64.10.0.26100.8249.nupkg",
+            "sha512": "50e3cb3e7947fd0f855fc976eae47cefec163d2a02414f52c26a097bcd058807192e9dbb90697d1f60fa82fd82ec1dd1d569a8b34e8c03382a44a975df8fcd26",
+            "size": 52951912,
+            "kind": "zip",
+            "prefix": "c/",
+            "dest": "winsdk-x64",
+            "probe": "winsdk-x64/um/x64/kernel32.lib"
+        },
+        {
+            "name": "python-3.12.10-embed-amd64.zip",
+            "url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+            "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+            "size": 11133606,
+            "kind": "zip",
+            "dest": "python",
+            "probe": "python/python.exe",
+            "launcher": true
+        }
+    ]
+}
